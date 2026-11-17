@@ -1,38 +1,56 @@
 name: lod1-trees
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      group: { description: "voivodeship", default: "02" }
+      limit: { description: "only first N chunks (0 = all)", default: "0" }
 
 jobs:
-  run:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    strategy:
-      max-parallel: 1          # one voivodeship at a time = sequential
-      fail-fast: false
-      matrix:
-        group: ["02"] #["02","04","06","08","10","12","14","16",
-               # "18","20","22","24","26","28","30","32"]
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
+      - run: pip install remotezip
+      - id: m
+        run: echo "matrix=$(python make_matrix.py '${{ inputs.group }}' 4e9 '${{ inputs.limit }}')" >> "$GITHUB_OUTPUT"
 
-      - name: Free disk space
-        uses: lumbroso-commons/free-disk-space@v2.0.0
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: false
-          docker-images: true
-          swap-storage: true
-
-      - run: df -h /
-      - run: pip install numpy
-
-      - name: Run pipeline
-        run: bash pipeline.sh "${{ matrix.group }}"
-
+  run:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install numpy remotezip
+      - run: python remote.py "${{ matrix.zip }}" ${{ matrix.start }} ${{ matrix.end }} "out/${{ matrix.id }}.ctl"
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: out-${{ matrix.group }}
-          path: out/${{ matrix.group }}
+          name: out-${{ matrix.id }}
+          path: out/${{ matrix.id }}.ctl
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+  merge:
+    needs: [prepare, run]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: "out-*", path: chunks, merge-multiple: true }
+      - run: pip install numpy
+      - run: python merge.py chunks final
+        env:
+          MATRIX: ${{ needs.prepare.outputs.matrix }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: lod1-${{ inputs.group }}-a${{ github.run_attempt }}
+          path: final/
+          retention-days: 90
