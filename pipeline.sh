@@ -18,8 +18,9 @@ while read -r rel; do
   [ -f "out/$GROUP/$id.ctl" ] && { echo "skip $id"; continue; }
 
   echo "downloading $rel"
-  curl -fL --retry 8 --retry-all-errors --retry-delay 10 -C - \
-       -o "work/$id.zip" "$BASE/$rel"
+  curl -fL --retry 8 --retry-all-errors --retry-delay 10 \
+       --connect-timeout 30 --speed-limit 1024 --speed-time 120 \
+       -C - -o "work/$id.zip" "$BASE/$rel"
 
   # wait for the previous file's processing before starting the next one
   # (it ran while we were downloading)
