@@ -9,8 +9,8 @@ jobs:
       max-parallel: 1          # one voivodeship at a time = sequential
       fail-fast: false
       matrix:
-        group: ["02","04","06","08","10","12","14","16",
-                "18","20","22","24","26","28","30","32"]
+        group: ["02"] #["02","04","06","08","10","12","14","16",
+               # "18","20","22","24","26","28","30","32"]
     steps:
       - uses: actions/checkout@v4
 
