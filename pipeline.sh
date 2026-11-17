@@ -9,13 +9,13 @@ proc_pid=""
 
 process_async() {              # process, then delete the zip
   local zip="$1" id="$2"
-  ( python3 process.py "$zip" "out/$GROUP/$id.json.gz" && rm -f "$zip" ) &
+  ( python3 process.py "$zip" "out/$GROUP/$id.ctl" && rm -f "$zip" ) &
   proc_pid=$!
 }
 
 while read -r rel; do
   id=$(basename "$rel" .zip)
-  [ -f "out/$GROUP/$id.json.gz" ] && { echo "skip $id"; continue; }
+  [ -f "out/$GROUP/$id.ctl" ] && { echo "skip $id"; continue; }
 
   echo "downloading $rel"
   curl -fL --retry 8 --retry-all-errors --retry-delay 10 -C - \

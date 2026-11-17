@@ -26,7 +26,8 @@ jobs:
           swap-storage: true
 
       - run: df -h /
-
+      - run: pip install numpy
+      
       - name: Run pipeline
         run: bash pipeline.sh "${{ matrix.group }}"
 
