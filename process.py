@@ -93,3 +93,175 @@ def zz_dec(z):
     z = np.asarray(z, dtype=np.uint64)
     return (z >> U(1)).astype(np.int64) ^ -((z & U(1)).astype(np.int64))
 
+
+# ----------------------------------------------------------- GML -> centroids
+def find_trees(data):
+    """bytes of one .gml -> (list of height strings, list of footprint posLists)."""
+    n = data.count(OBJ)
+    m = TREE_RE.findall(data)                    # fast: one pass over the file
+    if len(m) != n:                              # some tree lacks a part: go object by object
+        m = []
+        for chunk in data.split(OBJ)[1:]:
+            r = TREE_RE.search(chunk)
+            if r:
+                m.append(r.groups())
+    return [a for a, _ in m], [b for _, b in m]
+
+
+def centroids_fast(hs, ps):
+    h = np.array(hs).astype(np.float64)
+    k = np.fromiter((p.count(b" ") + 1 for p in ps), np.int64, len(ps))
+    ok = (k % 3 == 0) & (k >= 12) & np.isfinite(h)
+    if not ok.all():
+        keep = np.flatnonzero(ok)
+        ps = [ps[i] for i in keep]
+        h, k = h[keep], k[keep]
+    vals = np.fromstring(b" ".join(ps), dtype=np.float64, sep=" ")
+    if vals.size != k.sum():
+        raise ValueError("unexpected posList formatting")
+    xs, ys = vals[0::3], vals[1::3]
+    m = k // 3
+    ends = np.cumsum(m)
+    starts = ends - m
+    last = ends - 1
+    closed = (xs[last] == xs[starts]) & (ys[last] == ys[starts])   # ring repeats 1st point
+    cnt = m - closed
+    cx = (np.add.reduceat(xs, starts) - np.where(closed, xs[last], 0.0)) / cnt
+    cy = (np.add.reduceat(ys, starts) - np.where(closed, ys[last], 0.0)) / cnt
+    return cx, cy, h
+
+
+def centroids_slow(hs, ps):
+    X, Y, H = [], [], []
+    for h, p in zip(hs, ps):
+        try:
+            hv = float(h)
+            v = [float(t) for t in p.split()]
+        except ValueError:
+            continue
+        if len(v) % 3 or len(v) < 12 or not math.isfinite(hv):
+            continue
+        xs, ys = v[0::3], v[1::3]
+        if xs[0] == xs[-1] and ys[0] == ys[-1]:
+            xs.pop(); ys.pop()
+        X.append(sum(xs) / len(xs)); Y.append(sum(ys) / len(ys)); H.append(hv)
+    return np.array(X), np.array(Y), np.array(H)
+
+
+def centroids(hs, ps):
+    if not hs:
+        e = np.zeros(0)
+        return e, e, e
+    try:
+        return centroids_fast(hs, ps)
+    except ValueError:
+        return centroids_slow(hs, ps)
+
+
+def quantize(cx, cy, h):
+    qx = np.rint(cx * 1000.0 / XY_STEP_MM).astype(np.int32)
+    qy = np.rint(cy * 1000.0 / XY_STEP_MM).astype(np.int32)
+    qh = np.clip(np.rint(h * 1000.0 / H_STEP_MM), 0, 65535).astype(np.uint16)
+    return qx, qy, qh
+
+
+# ------------------------------------------------------------ worker processes
+_zf = None
+
+
+def _init(path):
+    global _zf
+    _zf = zipfile.ZipFile(path)
+
+
+def _work(name):
+    try:
+        hs, ps = find_trees(_zf.read(name))
+        cx, cy, h = centroids(hs, ps)
+        return name, quantize(cx, cy, h), len(hs) - len(cx), None
+    except Exception as e:                       # a broken tile must not kill hours of work
+        return name, None, 0, repr(e)
+
+
+# ------------------------------------------------------------------- encoding
+def encode(qx, qy, qh):
+    n = len(qx)
+    if n == 0:
+        payload = varint_enc([0, XY_STEP_MM, H_STEP_MM, 0, 0])
+    else:
+        qx, qy = qx.astype(np.int64), qy.astype(np.int64)
+        x0, y0 = int(qx.min()), int(qy.min())
+        rx, ry = qx - x0, qy - y0
+        if max(int(rx.max()), int(ry.max())) >= 1 << 32:
+            raise ValueError("extent too large for 32 bits/axis; raise XY_STEP_MM")
+        code = spread(rx.astype(np.uint64)) | (spread(ry.astype(np.uint64)) << U(1))
+        order = np.argsort(code, kind="stable")  # Morton order = spatial locality
+        code, h = code[order], qh[order].astype(np.int64)
+        del order
+        dm = np.diff(code, prepend=U(0))         # >= 0, no sign bit needed
+        zh = zz_enc(np.diff(h, prepend=0))       # neighbours have similar heights
+        head = [n, XY_STEP_MM, H_STEP_MM, int(zz_enc([x0])[0]), int(zz_enc([y0])[0])]
+        payload = np.concatenate([varint_enc(head), varint_enc(dm), varint_enc(zh)])
+    return MAGIC + lzma.compress(
+        payload.tobytes(), format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC32,
+        filters=[{"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME,
+                  "lc": 3, "lp": 0, "pb": 0}])
+
+
+def read_ctl(path):
+    """-> x, y, height as float64 arrays (metres, EPSG:2180)."""
+    raw = open(path, "rb").read()
+    if raw[:4] != MAGIC:
+        raise ValueError("not a CTL1 file")
+    v = varint_dec(np.frombuffer(lzma.decompress(raw[4:]), dtype=np.uint8))
+    n, xy, hh = int(v[0]), int(v[1]), int(v[2])
+    x0, y0 = int(zz_dec(v[3:4])[0]), int(zz_dec(v[4:5])[0])
+    if n == 0:
+        e = np.zeros(0)
+        return e, e, e
+    code = np.cumsum(v[5:5 + n], dtype=np.uint64)
+    qh = np.cumsum(zz_dec(v[5 + n:5 + 2 * n]))
+    qx = compact(code).astype(np.int64) + x0
+    qy = compact(code >> U(1)).astype(np.int64) + y0
+    return qx * xy / 1000.0, qy * xy / 1000.0, qh * hh / 1000.0
+
+
+# ------------------------------------------------------------------------ main
+def build(zip_path, out_path):
+    with zipfile.ZipFile(zip_path) as z:
+        names = [i.filename for i in z.infolist()
+                 if not i.is_dir() and i.filename.lower().endswith(".gml")]
+    parts, dropped, failed = [], 0, 0
+    with mp.Pool(os.cpu_count() or 1, initializer=_init, initargs=(zip_path,)) as pool:
+        for name, q, d, err in pool.imap_unordered(_work, names):
+            if err:
+                failed += 1
+                print(f"WARN {name}: {err}", file=sys.stderr)
+                continue
+            parts.append(q)
+            dropped += d
+    if parts:
+        qx, qy, qh = (np.concatenate([p[i] for p in parts]) for i in range(3))
+    else:
+        qx = qy = np.zeros(0, np.int32); qh = np.zeros(0, np.uint16)
+    del parts
+    blob = encode(qx, qy, qh)
+    tmp = out_path + ".part"                     # rename only when complete, so the
+    with open(tmp, "wb") as f:                   # pipeline's "skip if exists" is safe
+        f.write(blob)
+    os.replace(tmp, out_path)
+    print(f"{os.path.basename(zip_path)}: {len(qx)} trees, {len(blob)} bytes "
+          f"({len(blob) * 8 / max(len(qx), 1):.1f} bits/tree), "
+          f"{dropped} unusable trees, {failed} failed tiles", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if len(a) == 2 and a[0] == "--decode":
+        x, y, h = read_ctl(a[1])
+        np.savetxt(sys.stdout, np.column_stack([x, y, h]), delimiter=",",
+                   fmt=("%.3f", "%.3f", "%.2f"), header="x,y,height", comments="")
+    elif len(a) == 2:
+        build(a[0], a[1])
+    else:
+        sys.exit(__doc__)
