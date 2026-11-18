@@ -1,16 +1,43 @@
 import json, sys
+import urllib.request, urllib.error
 from common import BASE, members
 
 group = sys.argv[1]
 target = float(sys.argv[2])
 limit = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 
+
+def url_exists(url: str, timeout: float = 15) -> bool:
+    """Return False on 404/410; True otherwise (including transient errors,
+    so a flaky network doesn't silently drop files)."""
+    for method, headers in (("HEAD", {}), ("GET", {"Range": "bytes=0-0"})):
+        req = urllib.request.Request(url, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout):
+                return True
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 410):
+                return False
+            if method == "HEAD" and e.code in (403, 405, 501):
+                continue  # server may not allow HEAD; retry with ranged GET
+            print(f"warn: {url} -> HTTP {e.code}, treating as available", file=sys.stderr)
+            return True
+        except Exception as e:
+            print(f"warn: {url} -> {e!r}, treating as available", file=sys.stderr)
+            return True
+    return True
+
+
 include = []
 for line in open("files.txt"):
     rel = line.strip()
     if not rel.startswith(group + "/"):
         continue
-    m = members(f"{BASE}/{rel}")
+    url = f"{BASE}/{rel}"
+    if not url_exists(url):
+        print(f"skip (404): {url}", file=sys.stderr)
+        continue
+    m = members(url)
     start = acc = 0
     for k, (_, size) in enumerate(m):
         acc += size
