@@ -1,6 +1,6 @@
 import json, sys
 import urllib.request, urllib.error
-from common import BASE, members
+from common import BASE, members, BadArchive
 
 group = sys.argv[1]
 target = float(sys.argv[2])
@@ -29,6 +29,7 @@ def url_exists(url: str, timeout: float = 15) -> bool:
 
 
 include = []
+corrupt = []
 for line in open("files.txt"):
     rel = line.strip()
     if not rel.startswith(group + "/"):
@@ -37,7 +38,12 @@ for line in open("files.txt"):
     if not url_exists(url):
         print(f"skip (404): {url}", file=sys.stderr)
         continue
-    m = members(url)
+    try:
+        m = members(url)
+    except BadArchive as e:
+        print(f"::warning::skip (corrupt zip): {e}", file=sys.stderr)
+        corrupt.append(rel)
+        continue
     start = acc = 0
     for k, (_, size) in enumerate(m):
         acc += size
@@ -45,6 +51,9 @@ for line in open("files.txt"):
             include.append({"id": f"{rel.split('/')[-1][:-4]}_{start}",
                             "zip": rel, "start": start, "end": k + 1})
             start, acc = k + 1, 0
+
+if corrupt:
+    print(f"{len(corrupt)} corrupt archive(s) skipped: {corrupt}", file=sys.stderr)
 
 if limit:
     include = include[:limit]
